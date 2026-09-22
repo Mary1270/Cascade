@@ -166,3 +166,103 @@ minimal manual harness (this sandbox had no network to install real
 running tests rather than only syntax-checking them. All 18 tests passed
 after the fix; the real GitHub Actions CI run (`pytest`, with network
 access) subsequently confirmed the same 18/18 pass live.
+
+## 10. v0.2 round (Sep 22 2026): steward-flagged rework, redeployed and re-verified live
+
+The first portal submission (v0.1, addresses in §6) was **rejected** by a
+steward with this reasoning: the score determining payment was not
+independently validated against the milestone evidence — the original
+`prompt_non_comparative` `criteria` only audited the leader's
+self-reported JSON for internal consistency, never independently
+re-checking it against the real evidence. Full rework rationale is in
+`DESIGN_DECISIONS.md` §7. Summary of the code changes:
+
+- `ReviewerConsensusPanel.evaluate_milestone` switched from
+  `prompt_non_comparative` to `prompt_comparative`, so every validator
+  independently fetches the evidence and computes its own score.
+- `MilestoneEscrow.submit_milestone_evidence` now requires the caller to
+  be the project's `contractor` (previously anyone could submit evidence
+  for anyone's project).
+- Added `MilestoneEscrow.reset_stuck_milestone` /
+  `refund_stuck_milestone` (payer-only) as a recovery path for a
+  milestone permanently stuck `awaiting_score` (this is exactly what
+  happened to project 0 in §8 below, live).
+- Added an `attempt` nonce per milestone (closes a race where a
+  reset-then-resubmitted milestone could otherwise be scored by a stale,
+  late-arriving callback from the abandoned attempt).
+- A further live-only bug, found during this round's actual redeploy
+  (impossible to catch offline, since it depends on real LLM output
+  variance): under `prompt_comparative`, far more total LLM calls happen
+  per evaluation (every validator repeats all 3 calls, not just the
+  leader), and the first live attempt crashed with an uncaught
+  `json.decoder.JSONDecodeError` when one call returned plain prose
+  instead of strict JSON. Fixed with a regex-based fallback
+  (`_extract_score_fallback`) that still resolves to a number instead of
+  crashing the whole evaluation, and only raises a clean `UserError` if
+  truly no number can be found.
+
+All 28 offline tests (18 original + 10 from this rework) pass.
+
+**Full fresh redeploy was required** (not "Upgrade code"): `panel`/
+`registry`/`escrow` addresses are each set once in their respective
+constructors with no setter, so changing any one of the three
+contracts' code invalidates the others' stored references. All three
+were redeployed and rewired from a clean slate to avoid old (v0.1)
+project records interacting with new code that expects fields (`payer`,
+`attempt`) those old records don't have.
+
+**New deployed addresses:**
+- `PerformanceRegistry`: `0x953e68A85DC2dB534c77e8f7C4D623669e7B74e5`
+- `ReviewerConsensusPanel`: `0x685A937823100Da528f2Ec04bc2BF11788cf77e4`
+- `MilestoneEscrow`: `0x1a59066981596fd26D77D7d1346ea9faAa14d98c`
+
+**`prompt_comparative` confirmed live, directly closing the steward's
+gap**: project 0's milestone was submitted with evidence quality that
+made the *leader* alone compute `{"sub_scores": [70, 75, 45], "final_score": 65}`
+(visible in `EquivalenceOutputs`) — but the transaction's actual
+finalized `apply_score` callback carried **`score = 90`**, not 65. This
+means the validators, each independently re-fetching the evidence and
+re-running the three framings, did not simply rubber-stamp the leader's
+self-reported number — the number that actually reached consensus came
+from independent re-assessment, exactly the property the steward
+required. Released amount: 0.9 GEN of the 1 GEN milestone.
+
+**New authorization check confirmed live**: a second project (project 1)
+was created, then `submit_milestone_evidence` was called from a
+*different* wallet (`0x9Bf4a51B888C6FFBF337a25BF3179B07A6259128`, not the
+project's contractor) and correctly rolled back with "only the project's
+contractor can submit evidence".
+
+The regex-based JSON-parsing fallback was not exercised in this specific
+run (the evaluation succeeded without needing it) — it remains verified
+only by the offline tests (`test_non_json_llm_response_falls_back_to_regex_extraction`,
+`test_completely_non_numeric_llm_response_raises_cleanly`) pending a live
+occurrence.
+
+**Both new recovery methods confirmed live, including the exact scenario
+that motivated them:**
+
+- Project 2's milestone was deliberately submitted with a malformed
+  `evidence_url` (literal quote characters typed into the Studio form,
+  reproducing the same mistake that got project 0 permanently stuck in
+  v0.1). `evaluate_milestone` failed with `NondetException:
+  {'causes': ['MALFORMED_URL']}`, exactly as before, leaving the
+  milestone stuck `awaiting_score`.
+- `reset_stuck_milestone(2, 0)` succeeded, reopening the milestone
+  (`status` back to `"open"`, `description`/`evidence_url` cleared).
+- The milestone was resubmitted with a correct `evidence_url`. `attempt`
+  correctly incremented from `1` to `2`, confirming the nonce guard
+  updates on every real submission, not just the first. It resolved
+  normally: `sub_scores: [70, 86, 62]`, `final_score: 75`, `released:
+  0.75 GEN` — a full, real recovery from a permanently-stuck state.
+- A second milestone (project 3) was stuck the same way, and this time
+  `refund_stuck_milestone(3, 0)` was used instead: `status` moved to
+  `"refunded"` and the 1 GEN allocation was returned to the payer via
+  `emit_transfer`.
+- Separately, `submit_milestone_evidence` was called from a wallet that
+  was neither the project's contractor nor payer, for project 1: it
+  correctly rolled back with "only the project's contractor can submit
+  evidence", confirming the new authorization check on the redeployed
+  contract.
+
+

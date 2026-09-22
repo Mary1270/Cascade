@@ -271,16 +271,125 @@ answer to question 1.
   only the escrow's address (not each other's), keeping the dependency
   graph a simple star around `MilestoneEscrow` rather than a triangle.
 
-## 7. Status
+## 7. v0.2 rework: steward-flagged consensus gap (portal submission was rejected once)
+
+The first portal submission was rejected with this reasoning: **the score
+that determines payment was not independently validated against the
+milestone evidence.** `evaluate_milestone`'s original `prompt_non_comparative`
+`criteria` only audited the leader's self-reported JSON for internal
+consistency (right shape, sub-scores in range, final_score near their own
+mean) — no validator ever independently fetched the evidence page or
+independently judged it. A leader could therefore fabricate a
+self-consistent but false score (e.g. `final_score: 100` for genuinely
+incomplete work) and it would pass, because "internally consistent" and
+"actually reflects the evidence" are different properties, and only the
+first was being checked. This is a real, correctly-identified flaw, not a
+misunderstanding of the design.
+
+**Fix:** `evaluate_milestone` now wraps `analyze()` in
+`gl.eq_principle.prompt_comparative(analyze, principle)` instead of
+`prompt_non_comparative`. Under `prompt_comparative`, every validator
+independently re-executes the entire `analyze()` function — fetching the
+real evidence page itself and generating its own three sub-scores and
+final score — rather than merely auditing the leader's report. The
+`principle` text explicitly instructs graders to reject an output whose
+`final_score` diverges from an independent, honest reading of the actual
+evidence, "even if that output's own internal arithmetic is consistent" —
+directly closing the gap the steward identified. This also makes the
+three-way Python average (§2) now serve double duty: it's still
+deterministic (not LLM arithmetic), but it's also what gets independently
+reproduced and cross-checked by every node, rather than only checked for
+self-consistency by one.
+
+Two secondary gaps flagged in the same review, both real:
+
+- **`submit_milestone_evidence` had no caller authorization at all** —
+  anyone could submit evidence for anyone else's project. Fixed: the
+  project now stores a `payer` (the address that funded it, captured at
+  `create_project` time) alongside `contractor`, and
+  `submit_milestone_evidence` now requires
+  `gl.message.sender_address == contractor`.
+- **No recovery path existed for a milestone permanently stuck in
+  `awaiting_score`** — this happened live during testing (project 0,
+  caused by a malformed `evidence_url` making `gl.nondet.web.render` fail
+  inside `evaluate_milestone`, rolling back before ever calling back
+  `apply_score`). Fixed: two new payer-only methods,
+  `reset_stuck_milestone` (reopens the milestone for a fresh evidence
+  submission) and `refund_stuck_milestone` (permanently returns that
+  milestone's allocation to the payer). Both require the milestone to
+  currently be `awaiting_score`; recovery is a deliberate payer action,
+  not an automatic timeout, since GenVM gives no on-chain way to
+  distinguish "still processing" from "failed and never coming back."
+
+All 18 original offline tests plus 6 new ones (submit-authorization,
+reset/refund happy paths and rejections) pass — 24/24.
+
+**Two more issues found during a subsequent careful self-review (not
+flagged by the steward, found before resubmitting):**
+
+- **Stale-callback race:** if a payer calls `reset_stuck_milestone` and
+  the contractor resubmits, but the *original* (pre-reset) evaluation
+  transaction was only slow rather than actually failed, its late
+  callback could apply a stale score to the new submission — `apply_score`
+  had no way to tell which submission a given callback belonged to.
+  Fixed by adding an `attempt` nonce to each milestone, incremented on
+  every `submit_milestone_evidence` call and threaded through
+  `evaluate_milestone` → `apply_score`, which now rejects a callback
+  whose `attempt` doesn't match the milestone's current one. Covered by
+  `test_reset_then_resubmit_ignores_a_late_stale_callback` and
+  `test_apply_score_rejects_stale_attempt` — 26/26 offline tests pass.
+- **Untested language pattern:** the first draft of the recovery methods
+  factored their shared validation into a plain (undecorated) instance
+  method on the contract class. No contract in this series has ever used
+  a plain helper method on a `gl.Contract` subclass — only
+  `@gl.public.write`/`@gl.public.view` methods and nested closures inside
+  them (e.g. `analyze`/`ask` in `ReviewerConsensusPanel`) have been
+  live-verified. Rather than introduce an unverified pattern for a
+  cosmetic deduplication, the validation logic was inlined directly into
+  both `reset_stuck_milestone` and `refund_stuck_milestone`.
+
+**A third issue, found live during the actual redeploy (not caught by
+any offline test, since it depends on real LLM output variance):** the
+first live attempt with the new `prompt_comparative` code failed with an
+uncaught `json.decoder.JSONDecodeError` inside `ask()`. Under the
+original `prompt_non_comparative` design, only the leader ever called the
+LLM (3 calls total per evaluation); under `prompt_comparative`, every
+validator independently repeats the same 3 calls, so a single evaluation
+now involves far more total LLM calls — and at least one, across enough
+calls, will eventually ignore the "strict JSON only" instruction and
+return plain prose instead. `_extract_json_object` had no fallback for a
+response containing no `{...}` at all, so `json.loads` crashed the whole
+nondet block instead of degrading gracefully. Fixed by adding
+`_extract_score_fallback`: if JSON parsing fails, look for a `"score": n`
+style fragment via regex, then any bare 1-3 digit number, and only raise
+a clean `gl.vm.UserError` if truly nothing numeric is found (never
+silently default to 0, which would unfairly tank a real evaluation).
+Covered by two new tests (`test_non_json_llm_response_falls_back_to_regex_extraction`,
+`test_completely_non_numeric_llm_response_raises_cleanly`) — 28/28 pass.
+
+## 8. Status
 
 Design finalized; all three contracts written
 (`contracts/performance_registry.py`, `contracts/reviewer_consensus_panel.py`,
 `contracts/milestone_escrow.py`); offline test suite written and actually
-executed (18/18 passing) against a hand-written stub of the `genlayer` SDK
+executed (28/28 passing) against a hand-written stub of the `genlayer` SDK
 reused from Vigil (`tests/genlayer_stub/`), including the end-to-end
 scenario in §1. One real gap was found and fixed while running these
 tests: the reused stub had no `@gl.public.write.payable` support (never
 exercised by Vigil, needed here for `create_project`) — fixed in
-`tests/genlayer_stub/genlayer/__init__.py`. Not yet done: live deployment
-and wiring on Studio, the live end-to-end test, and `LESSONS_LEARNED.md`
-(which will only record what live testing actually confirms).
+`tests/genlayer_stub/genlayer/__init__.py`.
+
+Live deployment, wiring, and end-to-end verification on GenLayer Studio
+were completed and documented in `LESSONS_LEARNED.md` §1-7 — but that
+round used the pre-rework contract code (§7). `ReviewerConsensusPanel`
+and `MilestoneEscrow` changed in the rework (`PerformanceRegistry` did
+not). Redeploying either at a fresh address invalidates the *other*
+contracts' stored references to it (`panel`/`registry` in
+`MilestoneEscrow` and `escrow` in `PerformanceRegistry`/
+`ReviewerConsensusPanel` are all set once, with no setter to change them
+afterward) — so the practical redeploy path is either Studio's "Upgrade
+code" on the existing `ReviewerConsensusPanel`/`MilestoneEscrow`
+addresses (if it preserves the address and existing wiring), or, if
+that's unavailable, a full fresh deploy of all three contracts and
+rewiring from scratch. `LESSONS_LEARNED.md` §8+ records which path was
+used and the resulting addresses once redeployment is done.
