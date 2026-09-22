@@ -16,6 +16,7 @@ def _normalize_address(value) -> Address:
 STATUS_OPEN = "open"
 STATUS_AWAITING_SCORE = "awaiting_score"
 STATUS_SCORED = "scored"
+STATUS_REFUNDED = "refunded"
 
 # History window read from PerformanceRegistry before each new evaluation,
 # and the average-score bar a contractor must clear over that window for
@@ -62,11 +63,13 @@ class MilestoneEscrow(gl.Contract):
             )
 
         contractor_addr = _normalize_address(contractor)
+        payer_addr = gl.message.sender_address
         project_id = self.next_project_id
         self.next_project_id = self.next_project_id + 1
 
         record = {
             "contractor": str(contractor_addr),
+            "payer": str(payer_addr),
             "milestones": [
                 {
                     "allocation": a,
@@ -75,6 +78,7 @@ class MilestoneEscrow(gl.Contract):
                     "description": "",
                     "evidence_url": "",
                     "score": None,
+                    "attempt": 0,
                 }
                 for a in allocations
             ],
@@ -109,6 +113,8 @@ class MilestoneEscrow(gl.Contract):
             raise gl.vm.UserError("milestone is not open for new evidence")
 
         contractor_addr = _normalize_address(record["contractor"])
+        if gl.message.sender_address != contractor_addr:
+            raise gl.vm.UserError("only the project's contractor can submit evidence")
 
         recent_json = gl.get_contract_at(self.registry).view().get_recent_scores(
             contractor_addr, u256(TRUST_WINDOW)
@@ -122,17 +128,26 @@ class MilestoneEscrow(gl.Contract):
         milestone["status"] = STATUS_AWAITING_SCORE
         milestone["description"] = description
         milestone["evidence_url"] = evidence_url
+        milestone["attempt"] = milestone["attempt"] + 1
+        attempt = milestone["attempt"]
         self.projects[project_id] = json.dumps(record)
 
         gl.get_contract_at(self.panel).emit().evaluate_milestone(
-            project_id, milestone_index, contractor_addr, description, evidence_url, relaxed
+            project_id, milestone_index, contractor_addr, description, evidence_url,
+            relaxed, u256(attempt),
         )
 
     # Callback from ReviewerConsensusPanel only. Releases exactly
     # allocation * score / 100 - the core of the "proportional, not
-    # binary" mechanism.
+    # binary" mechanism. `attempt` must match the milestone's current
+    # submission nonce (see submit_milestone_evidence) - this rejects a
+    # late-arriving callback from a stale attempt that was superseded by
+    # reset_stuck_milestone + a fresh resubmission, closing a race where
+    # an old evaluation could otherwise silently score a new submission.
     @gl.public.write
-    def apply_score(self, project_id: u256, milestone_index: u256, score: u256) -> None:
+    def apply_score(
+        self, project_id: u256, milestone_index: u256, score: u256, attempt: u256
+    ) -> None:
         if gl.message.sender_address != self.panel:
             raise gl.vm.UserError("only the reviewer panel can apply a score")
         if project_id not in self.projects:
@@ -146,6 +161,8 @@ class MilestoneEscrow(gl.Contract):
         milestone = record["milestones"][idx]
         if milestone["status"] != STATUS_AWAITING_SCORE:
             raise gl.vm.UserError("milestone is not awaiting a score")
+        if int(attempt) != milestone["attempt"]:
+            raise gl.vm.UserError("stale evaluation attempt - milestone was reset since this evaluation started")
 
         score_int = int(score)
         amount = (milestone["allocation"] * score_int) // 100
@@ -160,6 +177,58 @@ class MilestoneEscrow(gl.Contract):
             gl.get_contract_at(contractor_addr).emit_transfer(value=amount)
 
         gl.get_contract_at(self.registry).emit().record_score(contractor_addr, score)
+
+    # If ReviewerConsensusPanel's evaluate_milestone transaction itself
+    # fails (e.g. an unreachable evidence_url, as happened live during
+    # testing - see LESSONS_LEARNED.md), it never calls back apply_score,
+    # and the milestone is permanently stuck in "awaiting_score" with no
+    # automatic way out: MilestoneEscrow has no on-chain way to detect
+    # *why* a callback hasn't arrived (it could simply still be
+    # processing), so recovery is a deliberate, payer-triggered action,
+    # not an automatic timeout. The payer (the account that funded the
+    # project) decides, off-chain, once they've confirmed via the
+    # explorer that the corresponding evaluate_milestone transaction
+    # actually failed - not merely that it hasn't finished yet.
+    @gl.public.write
+    def reset_stuck_milestone(self, project_id: u256, milestone_index: u256) -> None:
+        if project_id not in self.projects:
+            raise gl.vm.UserError("project not found")
+        record = json.loads(self.projects[project_id])
+        payer_addr = _normalize_address(record["payer"])
+        if gl.message.sender_address != payer_addr:
+            raise gl.vm.UserError("only the project's payer can recover a stuck milestone")
+        idx = int(milestone_index)
+        if idx < 0 or idx >= len(record["milestones"]):
+            raise gl.vm.UserError("milestone index out of range")
+        milestone = record["milestones"][idx]
+        if milestone["status"] != STATUS_AWAITING_SCORE:
+            raise gl.vm.UserError("milestone is not stuck awaiting a score")
+
+        milestone["status"] = STATUS_OPEN
+        milestone["description"] = ""
+        milestone["evidence_url"] = ""
+        self.projects[project_id] = json.dumps(record)
+
+    # Alternative to reset: permanently refund this milestone's allocation
+    # back to the payer instead of giving the contractor another attempt.
+    @gl.public.write
+    def refund_stuck_milestone(self, project_id: u256, milestone_index: u256) -> None:
+        if project_id not in self.projects:
+            raise gl.vm.UserError("project not found")
+        record = json.loads(self.projects[project_id])
+        payer_addr = _normalize_address(record["payer"])
+        if gl.message.sender_address != payer_addr:
+            raise gl.vm.UserError("only the project's payer can recover a stuck milestone")
+        idx = int(milestone_index)
+        if idx < 0 or idx >= len(record["milestones"]):
+            raise gl.vm.UserError("milestone index out of range")
+        milestone = record["milestones"][idx]
+        if milestone["status"] != STATUS_AWAITING_SCORE:
+            raise gl.vm.UserError("milestone is not stuck awaiting a score")
+
+        milestone["status"] = STATUS_REFUNDED
+        self.projects[project_id] = json.dumps(record)
+        gl.get_contract_at(payer_addr).emit_transfer(value=milestone["allocation"])
 
     @gl.public.view
     def get_project(self, project_id: u256) -> str:

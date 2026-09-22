@@ -3,6 +3,7 @@
 
 from genlayer import *
 import json
+import re
 
 
 def _normalize_address(value) -> Address:
@@ -35,6 +36,26 @@ def _clamp_score(value) -> int:
     except Exception:
         n = 0
     return max(0, min(100, n))
+
+
+def _extract_score_fallback(raw: str) -> int:
+    """Used only when the LLM's response isn't valid JSON at all (found
+    live: with prompt_comparative, every validator independently makes
+    its own LLM calls, so far more total calls happen than under the
+    original prompt_non_comparative design, and at least one occasionally
+    ignores the "strict JSON only" instruction). First look for a
+    'score': <n> style fragment even inside broken JSON; failing that,
+    fall back to the first 1-3 digit number in the text. Raises if truly
+    nothing numeric is found, rather than silently guessing 0 - a wrong
+    but confident 0 would unfairly tank a real evaluation."""
+    match = re.search(r'"?score"?\s*[:=]\s*(\d{1,3})', raw, re.IGNORECASE)
+    if not match:
+        match = re.search(r'\b(\d{1,3})\b', raw)
+    if not match:
+        raise gl.vm.UserError(
+            "could not extract a numeric score from the model response"
+        )
+    return _clamp_score(int(match.group(1)))
 
 
 class ReviewerConsensusPanel(gl.Contract):
@@ -73,6 +94,7 @@ class ReviewerConsensusPanel(gl.Contract):
         description: str,
         evidence_url: str,
         relaxed: bool,
+        attempt: u256,
     ) -> None:
         if not self.escrow_set or gl.message.sender_address != self.escrow:
             raise gl.vm.UserError("only the escrow contract can request scoring")
@@ -98,8 +120,11 @@ class ReviewerConsensusPanel(gl.Contract):
                     '{"score": <integer 0-100>, "reasoning": "<max 300 chars>"}'
                 )
                 raw = gl.nondet.exec_prompt(prompt)
-                parsed = json.loads(_extract_json_object(raw))
-                return _clamp_score(parsed.get("score", 0))
+                try:
+                    parsed = json.loads(_extract_json_object(raw))
+                    return _clamp_score(parsed.get("score", 0))
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    return _extract_score_fallback(raw)
 
             literal_score = ask(
                 "Strict literal reading: only count acceptance criteria "
@@ -118,11 +143,18 @@ class ReviewerConsensusPanel(gl.Contract):
             )
 
             sub_scores = [literal_score, outcome_score, skeptical_score]
-            # Deterministic Python average - the LLM only ever produces the
-            # three independent sub-scores, never the final arithmetic, so
-            # correctness of the average does not depend on an LLM
-            # validator successfully auditing LLM-generated arithmetic
-            # (the open question in DESIGN_DECISIONS.md #5, point 2).
+            # The three-way average and multiple-of-5 rounding are still
+            # deterministic Python, not LLM arithmetic - but correctness no
+            # longer rests on that alone. Because this whole function is
+            # wrapped in prompt_comparative (not prompt_non_comparative,
+            # see below), every validator independently re-executes this
+            # entire function - fetching the real evidence page itself and
+            # generating its own three sub-scores - rather than merely
+            # auditing the leader's self-reported JSON for internal
+            # consistency. A leader cannot fabricate a plausible-looking
+            # final_score unmoored from the actual evidence, because
+            # validators compare against their own independently-derived
+            # scores, not against the leader's arithmetic.
             raw_average = sum(sub_scores) / len(sub_scores)
             if relaxed:
                 raw_average = min(100.0, raw_average + 5.0)
@@ -135,22 +167,23 @@ class ReviewerConsensusPanel(gl.Contract):
             }
             return json.dumps(payload)
 
-        result_json = gl.eq_principle.prompt_non_comparative(
+        result_json = gl.eq_principle.prompt_comparative(
             analyze,
-            task=(
-                "Produce three independent 0-100 milestone-completion "
-                "sub-scores under three stated framings, plus a final "
-                "score."
-            ),
-            criteria=(
-                "The response must be strict JSON with 'sub_scores' (a "
-                "list of exactly 3 integers, each 0-100) and 'final_score' "
-                "(an integer 0-100 that is a multiple of 5, and within 10 "
-                "of the arithmetic mean of sub_scores). Reject the "
-                "response if sub_scores has the wrong length, any value is "
-                "outside 0-100, final_score is not a multiple of 5, or "
-                "final_score deviates from the mean of sub_scores by more "
-                "than 10."
+            (
+                "Each node independently fetches the evidence page at the "
+                "given URL and produces its own JSON with 'sub_scores' (3 "
+                "integers 0-100 under the three stated framings) and "
+                "'final_score' (their mean, rounded to the nearest multiple "
+                "of 5, plus a +5 trust bonus if relaxed). Two outputs are "
+                "equivalent only if their final_score values are within 15 "
+                "points of each other. Do NOT accept an output merely "
+                "because it is internally self-consistent (correct JSON "
+                "shape, sub_scores in range, final_score matching its own "
+                "reported sub_scores) - an output must be rejected as "
+                "non-equivalent if its final_score diverges from what an "
+                "independent, honest reading of the actual evidence at the "
+                "URL would produce, even if that output's own internal "
+                "arithmetic is consistent."
             ),
         )
 
@@ -160,5 +193,5 @@ class ReviewerConsensusPanel(gl.Contract):
         # Cross-contract .emit() calls, strictly outside the nondet/eq_principle
         # block above, per the standing rule confirmed since Tribunal.
         gl.get_contract_at(self.escrow).emit().apply_score(
-            project_id, milestone_index, u256(final_score)
+            project_id, milestone_index, u256(final_score), attempt
         )
