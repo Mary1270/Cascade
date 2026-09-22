@@ -38,6 +38,7 @@ def _fund_project(escrow, allocation=1000):
 
     record = json.loads(escrow.get_project(project_id))
     record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["attempt"] = 1
     escrow.projects[project_id] = json.dumps(record)
     return project_id
 
@@ -46,7 +47,7 @@ def test_evaluate_milestone_rejects_unauthorized_caller():
     _, panel, _ = make_wired()
     set_caller(STRANGER_ADDRESS)
     with pytest.raises(gl.vm.UserError):
-        panel.evaluate_milestone(0, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", False)
+        panel.evaluate_milestone(0, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", False, 1)
 
 
 def test_evaluate_milestone_averages_three_framings_and_releases_proportionally():
@@ -60,7 +61,7 @@ def test_evaluate_milestone_averages_three_framings_and_releases_proportionally(
             side_effect=[_score(60), _score(70), _score(65)],
         ):
             panel.evaluate_milestone(
-                project_id, 0, CONTRACTOR_ADDRESS, "do the thing", "https://x.test", False
+                project_id, 0, CONTRACTOR_ADDRESS, "do the thing", "https://x.test", False, 1
             )
 
     record = json.loads(escrow.get_project(project_id))
@@ -83,7 +84,7 @@ def test_relaxed_flag_adds_bonus_before_rounding():
             side_effect=[_score(60), _score(60), _score(60)],
         ):
             panel.evaluate_milestone(
-                project_id, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", True
+                project_id, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", True, 1
             )
 
     record = json.loads(escrow.get_project(project_id))
@@ -102,7 +103,7 @@ def test_final_score_never_exceeds_100_with_relaxed_bonus():
             side_effect=[_score(100), _score(98), _score(100)],
         ):
             panel.evaluate_milestone(
-                project_id, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", True
+                project_id, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", True, 1
             )
 
     record = json.loads(escrow.get_project(project_id))
@@ -120,10 +121,55 @@ def test_score_is_not_binary_across_a_range_of_inputs():
             side_effect=[_score(40), _score(45), _score(42)],
         ):
             panel.evaluate_milestone(
-                project_id, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", False
+                project_id, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", False, 1
             )
 
     record = json.loads(escrow.get_project(project_id))
     score = record["milestones"][0]["score"]
     assert score not in (0, 100)
     assert record["milestones"][0]["released"] == 1000 * score // 100
+
+
+def test_non_json_llm_response_falls_back_to_regex_extraction():
+    """Found live: with prompt_comparative, every validator makes its own
+    independent LLM calls, so far more total calls happen than under the
+    original design, and at least one occasionally ignores the "strict
+    JSON only" instruction and returns plain prose instead. This must
+    still resolve to a score, not crash the whole evaluation."""
+    _, panel, escrow = make_wired()
+    project_id = _fund_project(escrow, 1000)
+
+    set_caller(ESCROW_ADDRESS)
+    with patch.object(gl.nondet.web, "render", return_value="page"):
+        with patch.object(
+            gl.nondet, "exec_prompt",
+            side_effect=[
+                "I'd estimate the completion at about 72 out of 100.",
+                _score(70),
+                'Sure, here it is: {"score": 68, "reasoning": "close enough"}',
+            ],
+        ):
+            panel.evaluate_milestone(
+                project_id, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", False, 1
+            )
+
+    record = json.loads(escrow.get_project(project_id))
+    milestone = record["milestones"][0]
+    assert milestone["status"] == "scored"
+    # average(72, 70, 68) = 70 -> already a multiple of 5
+    assert milestone["score"] == 70
+
+
+def test_completely_non_numeric_llm_response_raises_cleanly():
+    _, panel, _ = make_wired()
+
+    set_caller(ESCROW_ADDRESS)
+    with patch.object(gl.nondet.web, "render", return_value="page"):
+        with patch.object(
+            gl.nondet, "exec_prompt",
+            return_value="I refuse to evaluate this without more context.",
+        ):
+            with pytest.raises(gl.vm.UserError):
+                panel.evaluate_milestone(
+                    0, 0, CONTRACTOR_ADDRESS, "desc", "https://x.test", False, 1
+                )

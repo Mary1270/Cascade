@@ -80,7 +80,77 @@ def test_apply_score_rejects_non_panel_caller():
 
     set_caller(STRANGER_ADDRESS)
     with pytest.raises(gl.vm.UserError):
-        escrow.apply_score(project_id, 0, 50)
+        escrow.apply_score(project_id, 0, 50, 0)
+
+
+def test_apply_score_rejects_stale_attempt():
+    """Isolates the attempt check from the status check: the milestone is
+    manually placed in 'awaiting_score' with a known attempt (simulating a
+    real in-flight evaluation that hasn't called back yet), so a
+    mismatched-attempt callback must be rejected specifically because of
+    the attempt, not because the status already changed."""
+    _, _, escrow = make_wired()
+    set_value(1000)
+    set_caller(CONTRACTOR_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+
+    record = json.loads(escrow.get_project(project_id))
+    record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["attempt"] = 1
+    escrow.projects[project_id] = json.dumps(record)
+
+    # Wrong attempt while status is still genuinely "awaiting_score" ->
+    # must be rejected by the attempt check itself.
+    set_caller(PANEL_ADDRESS)
+    with pytest.raises(gl.vm.UserError):
+        escrow.apply_score(project_id, 0, 99, 2)
+
+    # Confirm nothing was applied by the rejected call, then confirm the
+    # correct attempt genuinely succeeds against that same "awaiting_score"
+    # state.
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["status"] == "awaiting_score"
+    assert record["milestones"][0]["score"] is None
+
+    set_caller(PANEL_ADDRESS)
+    escrow.apply_score(project_id, 0, 80, 1)
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["status"] == "scored"
+    assert record["milestones"][0]["score"] == 80
+
+
+def test_reset_then_resubmit_ignores_a_late_stale_callback():
+    """The exact race the attempt nonce closes: a milestone is reset and
+    resubmitted, but the FIRST (pre-reset) evaluation's callback still
+    lands late, claiming the original attempt number. It must be rejected
+    rather than silently overwriting the new submission's real score."""
+    _, panel, escrow = make_wired()
+    project_id = _create_and_get_stuck(escrow)  # attempt stays 0 (forced stuck)
+
+    # Reset and resubmit for real -- this bumps attempt to 1 and, via the
+    # stub's synchronous cross-contract calls, immediately resolves with a
+    # real score.
+    set_caller(CONTRACTOR_ADDRESS)
+    escrow.reset_stuck_milestone(project_id, 0)
+    with patch.object(gl.nondet.web, "render", return_value="page"):
+        with patch.object(gl.nondet, "exec_prompt", side_effect=[_score(90)] * 3):
+            set_caller(CONTRACTOR_ADDRESS)
+            escrow.submit_milestone_evidence(project_id, 0, "real desc", "https://x.test")
+
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["status"] == "scored"
+    assert record["milestones"][0]["score"] == 90
+
+    # Now the original (attempt=0) evaluation, which was abandoned by the
+    # reset, finally "arrives" and tries to apply a stale, wrong score.
+    set_caller(PANEL_ADDRESS)
+    with pytest.raises(gl.vm.UserError):
+        escrow.apply_score(project_id, 0, 10, 0)
+
+    # The real, correctly-scored result must be untouched.
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["score"] == 90
 
 
 def test_good_track_record_relaxes_the_next_evaluation():
@@ -122,3 +192,104 @@ def test_no_track_record_uses_strict_threshold():
 
     record = json.loads(escrow.get_project(project_id))
     assert record["milestones"][0]["score"] == 60
+
+
+def test_submit_milestone_evidence_rejects_non_contractor():
+    _, _, escrow = make_wired()
+    set_value(1000)
+    set_caller(CONTRACTOR_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+
+    set_caller(STRANGER_ADDRESS)
+    with pytest.raises(gl.vm.UserError):
+        escrow.submit_milestone_evidence(project_id, 0, "not my milestone", "https://x.test")
+
+
+def _create_and_get_stuck(escrow, allocation=1000):
+    """Create a project and put milestone 0 into 'awaiting_score' directly,
+    simulating a real evaluate_milestone transaction that failed/rolled
+    back before ever calling apply_score (as happened live - see
+    LESSONS_LEARNED.md)."""
+    set_value(allocation)
+    set_caller(CONTRACTOR_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([allocation]))
+    set_value(0)
+
+    record = json.loads(escrow.get_project(project_id))
+    record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["description"] = "desc"
+    record["milestones"][0]["evidence_url"] = "https://bad.example/404"
+    escrow.projects[project_id] = json.dumps(record)
+    return project_id
+
+
+def test_reset_stuck_milestone_rejects_non_payer():
+    _, _, escrow = make_wired()
+    project_id = _create_and_get_stuck(escrow)
+
+    set_caller(STRANGER_ADDRESS)
+    with pytest.raises(gl.vm.UserError):
+        escrow.reset_stuck_milestone(project_id, 0)
+
+
+def test_reset_stuck_milestone_rejects_when_not_awaiting():
+    _, _, escrow = make_wired()
+    set_value(1000)
+    set_caller(CONTRACTOR_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+
+    # Milestone 0 is "open", not "awaiting_score" -- nothing to reset.
+    set_caller(CONTRACTOR_ADDRESS)
+    with pytest.raises(gl.vm.UserError):
+        escrow.reset_stuck_milestone(project_id, 0)
+
+
+def test_reset_stuck_milestone_reopens_for_the_payer():
+    _, _, escrow = make_wired()
+    project_id = _create_and_get_stuck(escrow)
+
+    set_caller(CONTRACTOR_ADDRESS)  # payer == contractor in this test
+    escrow.reset_stuck_milestone(project_id, 0)
+
+    record = json.loads(escrow.get_project(project_id))
+    milestone = record["milestones"][0]
+    assert milestone["status"] == "open"
+    assert milestone["description"] == ""
+    assert milestone["evidence_url"] == ""
+
+    # And it can now genuinely be resubmitted.
+    with patch.object(gl.nondet.web, "render", return_value="page"):
+        with patch.object(gl.nondet, "exec_prompt", side_effect=[_score(80)] * 3):
+            set_caller(CONTRACTOR_ADDRESS)
+            escrow.submit_milestone_evidence(project_id, 0, "desc", "https://x.test")
+
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["status"] == "scored"
+
+
+def test_refund_stuck_milestone_rejects_non_payer():
+    _, _, escrow = make_wired()
+    project_id = _create_and_get_stuck(escrow)
+
+    set_caller(STRANGER_ADDRESS)
+    with pytest.raises(gl.vm.UserError):
+        escrow.refund_stuck_milestone(project_id, 0)
+
+
+def test_refund_stuck_milestone_marks_refunded():
+    _, _, escrow = make_wired()
+    project_id = _create_and_get_stuck(escrow, allocation=1000)
+
+    set_caller(CONTRACTOR_ADDRESS)  # payer == contractor in this test
+    escrow.refund_stuck_milestone(project_id, 0)
+
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["status"] == "refunded"
+
+    # A refunded milestone cannot be reset or refunded again.
+    with pytest.raises(gl.vm.UserError):
+        escrow.reset_stuck_milestone(project_id, 0)
+    with pytest.raises(gl.vm.UserError):
+        escrow.refund_stuck_milestone(project_id, 0)
