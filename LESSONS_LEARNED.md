@@ -265,4 +265,86 @@ that motivated them:**
   evidence", confirming the new authorization check on the redeployed
   contract.
 
+## 11. v0.3 round (Sep 27 2026): second steward rejection, exact-match consensus confirmed live
+
+The v0.2 resubmission (§10) was **rejected again**: the "final scores
+within 15 points are equivalent" tolerance allowed materially different
+payouts to pass the same consensus round — v0.2's own cited proof (a
+leader computing 65, but a paid-out score of 90) was actually evidence of
+this flaw, not of the fix working. Full rationale in
+`DESIGN_DECISIONS.md` §8.
+
+Fix: `final_score`'s rounding bucket widened from the nearest multiple of
+5 to the nearest multiple of 20, and the `prompt_comparative` principle
+now requires **exact** equality of `final_score` — no tolerance window at
+all. Also added (not steward-mandated, proactive): `PerformanceRegistry`
+and `ReviewerConsensusPanel`'s `set_escrow`, and two new
+`MilestoneEscrow` methods `set_panel`/`set_registry`, are now
+owner-updatable instead of call-once, so a future single-contract fix
+won't require redeploying all three again (`DESIGN_DECISIONS.md` §9).
+30 offline tests pass in total: 28 carried over from the v0.2 rework
+(re-derived for the new bucket width) plus 2 new ones covering the
+updatable setters.
+
+**Full fresh redeploy of all three contracts was required again** (same
+reasoning as v0.2 → v0.3: `ReviewerConsensusPanel`'s code changed, and
+the address-updatability change touched all three). This is expected to
+be the last full-redeploy round — future single-contract fixes should
+only need `set_panel`/`set_registry`/`set_escrow` calls, not a redeploy
+of the unaffected contracts.
+
+**New deployed addresses:**
+- `PerformanceRegistry`: `0xC5b75c32d8c5C283aAC6d131EdC6C49aF7D975D0`
+- `ReviewerConsensusPanel`: `0x4DBD52C8C3524B9e94D643200717682c476636D4`
+- `MilestoneEscrow`: `0xc7227c4220042b00A0D94DD62D8F28cBe2E207c4`
+
+**Exact-match consensus confirmed live, directly closing the second
+gap**: a milestone's leader computed
+`{"sub_scores": [80, 90, 70], "final_score": 80}` (visible in
+`EquivalenceOutputs`), and the finalized `apply_score` callback carried
+**the identical `score = 80`** — not merely a close value. `Rotation
+Count: 0` on both the `evaluate_milestone` and `apply_score`
+transactions confirms every validator agreed on this exact number on the
+first attempt, without needing a leader/validator rotation to reach
+consensus. Released amount: 0.8 GEN of the 1 GEN milestone.
+
+**New authorization check confirmed live**: `MilestoneEscrow.set_panel`,
+called from a non-owner wallet, correctly rolled back with "only owner
+can set panel".
+
+**A new failure mode discovered live, and confirmed recoverable:** with
+exact-match consensus, ambiguous evidence can cause the three framings
+(literal/outcome/skeptical) to diverge so widely across independently-run
+nodes (e.g. one run: `sub_scores: [28, 74, 45]` on one node vs `[80, 100,
+50]` on a retry) that the network cannot reach exact agreement even after
+retrying with different workers, and the transaction ends with status
+`CANCELED` (not a clean `ERROR`) - a third distinct failure shape,
+alongside the `MALFORMED_URL` `ERROR` seen in v0.2. Confirmed live:
+`reset_stuck_milestone` works identically for a `CANCELED` evaluation as
+for an `ERROR`'d one, since `MilestoneEscrow` only ever checks the
+milestone's own `status` field, not why a callback never arrived. Two
+consecutive `CANCELED` results occurred for the same ambiguous,
+claim-laden evidence text; switching to a plainly-descriptive,
+non-evaluative evidence text (listing only what's literally observable in
+the repo, with no claims like "passing CI") produced unanimous agreement
+(`sub_scores: [100, 100, 100]`) and finalized cleanly on the very next
+attempt (`attempt: 3`). **Practical takeaway for future evidence text:**
+prefer plain, verifiable descriptions over persuasive/claim-heavy ones -
+the latter invites the skeptical framing to diverge sharply from the
+outcome framing, which exact-match consensus can no longer paper over
+with a tolerance window.
+
+**Relaxed-bonus trigger condition confirmed live with real data:** after
+two milestones scored 80 and 100 (recorded to `PerformanceRegistry`), the
+contractor's 3-window average financial history reached 93.3 (>= the 85
+threshold), confirmed via `get_recent_scores`. The relaxed bonus's exact
+effect on a specific raw average (shifting which 20-wide bucket a
+borderline score lands in) was not separately re-demonstrated live in
+this round beyond confirming the trigger condition itself activates
+correctly from real recorded history - the arithmetic of the +5 bonus
+before rounding is already exhaustively covered by controlled-input
+offline tests (`test_relaxed_flag_adds_bonus_before_rounding` and
+`test_good_track_record_relaxes_the_next_evaluation`), which is the
+appropriate place to verify it precisely; live LLM output cannot be
+steered to a specific raw average on demand.
 

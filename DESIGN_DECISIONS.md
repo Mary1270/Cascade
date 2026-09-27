@@ -21,7 +21,7 @@ quantity — not just a new binary decided by a new prompt.
 
 **A milestone escrow that releases payment proportional to an aggregated
 confidence score (0–100), not an all-or-nothing vote.** If a milestone is
-assessed at 65% complete, 65% of that milestone's allocated funds are
+assessed at 80% complete, 80% of that milestone's allocated funds are
 released — nothing is rounded up to "pass" or down to "fail." This is a
 different consensus *primitive* from Tribunal/Vigil, not a different
 consensus *topic*: their equivalence principles all converge on a label
@@ -53,10 +53,10 @@ Three primitives, and why none of them stands alone:
 The test that would fail if this cycle were faked (implemented in
 `tests/test_milestone_escrow.py::test_good_track_record_relaxes_the_next_evaluation`
 and `test_no_track_record_uses_strict_threshold`, and end-to-end in
-`tests/test_end_to_end.py`): identical raw LLM sub-scores (61, 61, 61) are
+`tests/test_end_to_end.py`): identical raw LLM sub-scores (70, 70, 67) are
 submitted twice — once for a contractor with no history, once for a
 contractor with three prior scores averaging ≥ 85 — and the released
-amount is asserted to differ (60% vs 65% of the milestone). A second test
+amount is asserted to differ (60% vs 80% of the milestone). A second test
 that would fail under a disguised binary wrapper: at least one milestone
 in the end-to-end run resolves to a percentage that is neither 0 nor 100,
 and the GEN amount transferred is asserted to equal exactly
@@ -264,9 +264,10 @@ answer to question 1.
   transactions in the explorer) to see the result, exactly as Tribunal's
   appeal flow and Vigil's dispute flow already required.
 - Every milestone has an explicit `status` field (`open` → `awaiting_score`
-  → `scored`) specifically so `apply_score` can reject a stray or repeated
-  callback, and so `submit_milestone_evidence` can reject new evidence
-  for a milestone that's already mid-flight.
+  → `scored`, or → `refunded` via the v0.2 recovery path, §7) specifically
+  so `apply_score` can reject a stray or repeated callback, and so
+  `submit_milestone_evidence` can reject new evidence for a milestone
+  that's already mid-flight.
 - `ReviewerConsensusPanel` and `PerformanceRegistry` each need to know
   only the escrow's address (not each other's), keeping the dependency
   graph a simple star around `MilestoneEscrow` rather than a triangle.
@@ -367,12 +368,91 @@ silently default to 0, which would unfairly tank a real evaluation).
 Covered by two new tests (`test_non_json_llm_response_falls_back_to_regex_extraction`,
 `test_completely_non_numeric_llm_response_raises_cleanly`) — 28/28 pass.
 
-## 8. Status
+## 8. v0.3 rework: second steward rejection — tolerance windows leak payout materiality
+
+The v0.2 resubmission (§7) was **rejected again**, with a sharper and
+correctly-targeted criticism: *"The validator treats final scores up to
+15 points apart as equivalent, but the exact score directly determines
+the contractor's payment and later performance history. That allows
+materially different outcomes to pass consensus."*
+
+This is a real flaw in the v0.2 fix, not a misunderstanding. The
+`prompt_comparative` principle's own live-verification data (in
+`LESSONS_LEARNED.md` §10, cited in the v0.2 submission as *proof the fix
+worked*) actually demonstrates the problem: a leader computed
+`final_score = 65`, but the transaction that reached consensus and paid
+out used `score = 90` — a 25-point, ~25%-of-milestone difference in real
+GEN transferred, both sides of which the "within 15" tolerance was
+willing to call "equivalent." Closing the *self-report-without-checking*
+gap (v0.2) was necessary but not sufficient: a tolerance window on the
+value that directly determines a real fund transfer is itself a second,
+independent way for materially different outcomes to pass the same
+consensus round.
+
+**Fix:** `final_score`'s rounding bucket widened from the nearest
+multiple of 5 to the nearest multiple of `ROUND_BUCKET = 20` (constant in
+`reviewer_consensus_panel.py`), and the `prompt_comparative` principle
+now requires **exact equality** of `final_score` — "even one bucket off"
+is explicitly named as non-equivalent, with no numeric tolerance at all.
+This directly implements the steward's suggested remedy: *"bind
+validation to a payout-preserving result, such as ... a canonical value
+whose entire accepted range produces the same material outcome."* The
+bucket width was widened specifically so that ordinary LLM sampling noise
+across independently-run nodes is still likely to land in the same
+bucket — an exact-match requirement on a 21-value scale (multiples of 5)
+would make consensus rounds fail far more often than on a 6-value scale
+(multiples of 20). The mechanism remains clearly non-binary (six possible
+payout tiers: 0/20/40/60/80/100), just coarser than the original design.
+
+All 28 offline tests were re-derived for the new bucket width (several
+test inputs changed specifically because their old expected outputs were
+bucket-5 artifacts — e.g. sub-scores averaging 69 now round to bucket 80
+with the relaxed trust bonus and bucket 60 without it, replacing the old
+61-average example that no longer demonstrated the bonus's effect once
+buckets widened to 20). 28/28 pass.
+
+**Not yet re-verified live** as of this writing — the v0.2 addresses
+(`LESSONS_LEARNED.md` §10) used the pre-v0.3 rounding/principle and must
+be treated as deprecated once v0.3 is redeployed and re-tested; a v0.3
+round will be added to `LESSONS_LEARNED.md` once that's done.
+
+## 9. Operational resilience: owner-updatable contract addresses (not steward-mandated, added proactively)
+
+Both v0.2 and v0.3 each required a full fresh redeploy of **all three**
+contracts, purely because `panel`/`registry` (in `MilestoneEscrow`) and
+`escrow` (in `PerformanceRegistry` and `ReviewerConsensusPanel`) could
+only ever be set once, in the constructor or via a call-once setter, with
+no way to repoint them afterward. Every time exactly one contract's code
+needed to change, the other two - whose own code was unchanged - still
+had to be redeployed solely to receive a fresh set of addresses pointing
+at each other and at the one contract that actually changed.
+
+**Fix:** `set_escrow` on both `PerformanceRegistry` and
+`ReviewerConsensusPanel` is now owner-gated but **updatable**, not
+call-once. `MilestoneEscrow` gained two new owner-gated methods,
+`set_panel` and `set_registry`, so it no longer needs to be redeployed
+just because the *other* two contracts' code changed. This doesn't
+change the trust model: the owner already fully controls the initial
+wiring of all three contracts at deploy time, so letting them repoint an
+address later grants no capability an honest owner didn't already
+effectively have by redeploying everything - it only removes the need
+to. A future fix to, say, `ReviewerConsensusPanel` alone will now only
+require deploying the new panel and calling `escrow.set_panel(new_panel)`
++ `new_panel.set_escrow(escrow_address)` - `PerformanceRegistry` and
+`MilestoneEscrow` themselves stay untouched, at the same addresses,
+with all existing project history intact.
+
+Covered by three new offline tests (owner-only + repointing behavior for
+each of the three setters, including a full `apply_score` call proving
+the OLD panel address is rejected and the NEW one is accepted after
+`set_panel`). 30/30 tests pass.
+
+## 10. Status
 
 Design finalized; all three contracts written
 (`contracts/performance_registry.py`, `contracts/reviewer_consensus_panel.py`,
 `contracts/milestone_escrow.py`); offline test suite written and actually
-executed (28/28 passing) against a hand-written stub of the `genlayer` SDK
+executed (30/30 passing) against a hand-written stub of the `genlayer` SDK
 reused from Vigil (`tests/genlayer_stub/`), including the end-to-end
 scenario in §1. One real gap was found and fixed while running these
 tests: the reused stub had no `@gl.public.write.payable` support (never
@@ -380,16 +460,14 @@ exercised by Vigil, needed here for `create_project`) — fixed in
 `tests/genlayer_stub/genlayer/__init__.py`.
 
 Live deployment, wiring, and end-to-end verification on GenLayer Studio
-were completed and documented in `LESSONS_LEARNED.md` §1-7 — but that
-round used the pre-rework contract code (§7). `ReviewerConsensusPanel`
-and `MilestoneEscrow` changed in the rework (`PerformanceRegistry` did
-not). Redeploying either at a fresh address invalidates the *other*
-contracts' stored references to it (`panel`/`registry` in
-`MilestoneEscrow` and `escrow` in `PerformanceRegistry`/
-`ReviewerConsensusPanel` are all set once, with no setter to change them
-afterward) — so the practical redeploy path is either Studio's "Upgrade
-code" on the existing `ReviewerConsensusPanel`/`MilestoneEscrow`
-addresses (if it preserves the address and existing wiring), or, if
-that's unavailable, a full fresh deploy of all three contracts and
-rewiring from scratch. `LESSONS_LEARNED.md` §8+ records which path was
-used and the resulting addresses once redeployment is done.
+were completed twice on GenLayer Studio: a v0.1 round and, after the
+first steward rejection, a v0.2 round (both documented in
+`LESSONS_LEARNED.md` §1-10). Both used contract code now superseded by
+v0.3 (§8, the second steward rejection) and the address-updatability
+change (§9) — all three deployed addresses from both prior rounds are
+deprecated. Because v0.3 changes `ReviewerConsensusPanel`'s code (and
+§9's address-updatability changes touch all three contracts), a full
+fresh deploy of all three is required one more time; going forward,
+thanks to §9, a change confined to one contract should no longer require
+redeploying the other two. `LESSONS_LEARNED.md` §11+ records the v0.3
+deployment and re-verification once it's done.

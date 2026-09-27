@@ -2,7 +2,7 @@
 
 A GenLayer Intelligent Contract project: a milestone escrow that releases
 payment **proportional to a graded confidence score (0–100)**, instead of
-an all-or-nothing pass/fail vote — a 65%-complete milestone releases 65%
+an all-or-nothing pass/fail vote — an 80%-complete milestone releases 80%
 of its allocated funds, not a rounded pass or fail.
 
 See `DESIGN_DECISIONS.md` for the full architecture rationale, equivalence
@@ -13,7 +13,7 @@ principle justifications per contract, and confirmed GenVM constraints.
 | Contract | Role |
 |---|---|
 | `contracts/performance_registry.py` | Append-only, policy-free history of each contractor's past scores. |
-| `contracts/reviewer_consensus_panel.py` | Turns milestone evidence into a 0–100 confidence score: three independently-framed LLM readings per node, cross-checked for convergence via `prompt_comparative` so every validator independently re-assesses the real evidence rather than auditing the leader's self-report. |
+| `contracts/reviewer_consensus_panel.py` | Turns milestone evidence into a 0–100 confidence score: three independently-framed LLM readings per node, rounded to a canonical bucket of 20 and cross-checked for **exact** equality via `prompt_comparative` — no tolerance window on the payout-determining value — so every validator independently re-assesses the real evidence rather than auditing the leader's self-report or approving a materially different payout. |
 | `contracts/milestone_escrow.py` | Holds project funds, reads a contractor's history before each evaluation, requests scoring, and releases exactly `allocation * score / 100`. Only the project's contractor may submit evidence; only the payer can recover a milestone stuck `awaiting_score`. |
 
 > **v0.2 note:** the first portal submission was rejected because the
@@ -23,6 +23,14 @@ principle justifications per contract, and confirmed GenVM constraints.
 > (switch to `prompt_comparative`, added evidence-submission
 > authorization, added `reset_stuck_milestone`/`refund_stuck_milestone`
 > recovery paths).
+>
+> **v0.3 note:** the resubmission was rejected again — the "within 15
+> points" tolerance on `final_score` itself allowed materially different
+> payouts to pass as "equivalent" (one live run had a leader compute 65
+> while the accepted, paid-out score was 90). Fixed by widening the
+> rounding bucket to 20 and requiring **exact** `final_score` equality in
+> the `prompt_comparative` principle — no numeric tolerance at all. See
+> `DESIGN_DECISIONS.md` §8.
 
 ## How the three contracts work together
 
@@ -36,9 +44,10 @@ principle justifications per contract, and confirmed GenVM constraints.
 3. `ReviewerConsensusPanel.evaluate_milestone` — fetches the evidence
    page, asks the LLM for three independent 0–100 sub-scores under three
    framings, averages them in Python, applies the relaxed bonus, rounds
-   to the nearest multiple of 5 — and, via `prompt_comparative`, every
+   to the nearest multiple of 20 — and, via `prompt_comparative`, every
    validator independently repeats this whole process against the real
-   evidence rather than just checking the leader's report. Calls back
+   evidence and must arrive at the **exact same** final value (no
+   tolerance window) for consensus to accept it. Calls back
    `MilestoneEscrow.apply_score` (`.emit()`).
 4. `MilestoneEscrow.apply_score` — releases `allocation * score / 100` to
    the contractor and records the score to `PerformanceRegistry`
@@ -62,6 +71,16 @@ the evidence — read `get_project` afterward to see the result.
 3. `MilestoneEscrow(panel_address, registry_address)`.
 4. `ReviewerConsensusPanel.set_escrow(escrow_address)`.
 5. `PerformanceRegistry.set_escrow(escrow_address)`.
+
+**Updating one contract later:** `set_escrow` (on the registry and the
+panel) and `MilestoneEscrow.set_panel`/`set_registry` are owner-gated but
+updatable, not call-once (see `DESIGN_DECISIONS.md` §9). If only
+`ReviewerConsensusPanel`'s code changes in the future, deploy the new
+panel, call `escrow.set_panel(new_panel_address)`, then
+`new_panel.set_escrow(escrow_address)` — `PerformanceRegistry` and
+`MilestoneEscrow` stay at their existing addresses with all project
+history intact. The same pattern applies to a `PerformanceRegistry` or
+`MilestoneEscrow`-only change.
 
 ## Testing
 
