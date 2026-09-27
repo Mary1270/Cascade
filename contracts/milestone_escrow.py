@@ -41,6 +41,29 @@ class MilestoneEscrow(gl.Contract):
         self.registry = _normalize_address(registry_address)
         self.next_project_id = u256(0)
 
+    # Owner-updatable pointers to the other two contracts. v0.2 and v0.3
+    # each needed a full fresh redeploy of all three contracts purely
+    # because these addresses were only ever set in the constructor, with
+    # no way to repoint them when ReviewerConsensusPanel or
+    # PerformanceRegistry's code changed (and therefore address) without
+    # this one's own code changing. The owner already fully controls
+    # initial wiring, so letting them repoint these later grants no new
+    # capability an honest owner didn't already effectively have via
+    # redeploy - it just avoids the redeploy. Existing projects/milestones
+    # are unaffected: only future evaluate_milestone/apply_score/
+    # record_score calls use the newly-pointed-to address.
+    @gl.public.write
+    def set_panel(self, panel_address) -> None:
+        if gl.message.sender_address != self.owner:
+            raise gl.vm.UserError("only owner can set panel")
+        self.panel = _normalize_address(panel_address)
+
+    @gl.public.write
+    def set_registry(self, registry_address) -> None:
+        if gl.message.sender_address != self.owner:
+            raise gl.vm.UserError("only owner can set registry")
+        self.registry = _normalize_address(registry_address)
+
     # Funds a new project. `milestone_allocations_json` is a JSON array of
     # integer amounts (same 18-decimal units as gl.message.value) - passed
     # as a JSON string rather than a typed list parameter, since no

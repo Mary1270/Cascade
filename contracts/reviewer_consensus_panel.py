@@ -58,6 +58,23 @@ def _extract_score_fallback(raw: str) -> int:
     return _clamp_score(int(match.group(1)))
 
 
+# The canonical rounding bucket for final_score. This is deliberately wide:
+# a first version rounded to the nearest multiple of 5 and let the
+# equivalence principle treat any two final_scores within 15 points as
+# "equivalent" - but final_score is the exact number that determines the
+# payout percentage and the value recorded in PerformanceRegistry, so a
+# steward review correctly rejected that as allowing materially different
+# payouts (e.g. 65 vs 90) to both pass consensus. The fix binds validation
+# to the payout-preserving value itself: final_score is now rounded to the
+# nearest multiple of ROUND_BUCKET, and prompt_comparative below requires
+# EXACT equality of that value, not a tolerance window on it. The bucket is
+# widened from 5 to 20 specifically so that ordinary LLM sampling noise
+# across independently-run leader/validator evaluations is likely to still
+# land in the same bucket, keeping exact-match consensus achievable while
+# the mechanism remains clearly non-binary (0/20/40/60/80/100).
+ROUND_BUCKET = 20
+
+
 class ReviewerConsensusPanel(gl.Contract):
     owner: Address
     escrow: Address
@@ -68,12 +85,13 @@ class ReviewerConsensusPanel(gl.Contract):
         self.escrow = Address(int(0).to_bytes(20, "big"))
         self.escrow_set = False
 
+    # Owner-updatable, not call-once - see PerformanceRegistry.set_escrow
+    # for the rationale (avoids a full redeploy every time MilestoneEscrow
+    # changes address).
     @gl.public.write
     def set_escrow(self, escrow_address) -> None:
         if gl.message.sender_address != self.owner:
             raise gl.vm.UserError("only owner can set escrow")
-        if self.escrow_set:
-            raise gl.vm.UserError("escrow already set")
         self.escrow = _normalize_address(escrow_address)
         self.escrow_set = True
 
@@ -143,22 +161,22 @@ class ReviewerConsensusPanel(gl.Contract):
             )
 
             sub_scores = [literal_score, outcome_score, skeptical_score]
-            # The three-way average and multiple-of-5 rounding are still
-            # deterministic Python, not LLM arithmetic - but correctness no
-            # longer rests on that alone. Because this whole function is
-            # wrapped in prompt_comparative (not prompt_non_comparative,
-            # see below), every validator independently re-executes this
-            # entire function - fetching the real evidence page itself and
-            # generating its own three sub-scores - rather than merely
-            # auditing the leader's self-reported JSON for internal
-            # consistency. A leader cannot fabricate a plausible-looking
-            # final_score unmoored from the actual evidence, because
-            # validators compare against their own independently-derived
-            # scores, not against the leader's arithmetic.
+            # The three-way average is still deterministic Python, not LLM
+            # arithmetic - but correctness no longer rests on that alone.
+            # Because this whole function is wrapped in prompt_comparative
+            # (not prompt_non_comparative), every validator independently
+            # re-executes this entire function - fetching the real evidence
+            # page itself and generating its own three sub-scores - rather
+            # than merely auditing the leader's self-reported JSON for
+            # internal consistency. final_score is rounded to the nearest
+            # ROUND_BUCKET (see its definition above for why 20, not 5) so
+            # that ordinary LLM sampling noise across nodes is likely to
+            # still land on the same canonical value - the principle below
+            # requires that value to match EXACTLY, not approximately.
             raw_average = sum(sub_scores) / len(sub_scores)
             if relaxed:
                 raw_average = min(100.0, raw_average + 5.0)
-            final_score = int(round(raw_average / 5.0)) * 5
+            final_score = int(round(raw_average / ROUND_BUCKET)) * ROUND_BUCKET
             final_score = _clamp_score(final_score)
 
             payload = {
@@ -173,13 +191,19 @@ class ReviewerConsensusPanel(gl.Contract):
                 "Each node independently fetches the evidence page at the "
                 "given URL and produces its own JSON with 'sub_scores' (3 "
                 "integers 0-100 under the three stated framings) and "
-                "'final_score' (their mean, rounded to the nearest multiple "
-                "of 5, plus a +5 trust bonus if relaxed). Two outputs are "
-                "equivalent only if their final_score values are within 15 "
-                "points of each other. Do NOT accept an output merely "
+                f"'final_score' (their mean, rounded to the nearest "
+                f"multiple of {ROUND_BUCKET}, plus a +5 trust bonus before "
+                "rounding if relaxed). final_score is the exact number "
+                "that determines the contractor's payout percentage and "
+                "the value recorded in their performance history, so two "
+                "outputs are equivalent ONLY if their final_score values "
+                "are EXACTLY equal - not merely close. A final_score that "
+                "is off by even one bucket must be rejected as "
+                "non-equivalent, because it would produce a materially "
+                "different, real payout. Do NOT accept an output merely "
                 "because it is internally self-consistent (correct JSON "
                 "shape, sub_scores in range, final_score matching its own "
-                "reported sub_scores) - an output must be rejected as "
+                "reported sub_scores) - an output must also be rejected as "
                 "non-equivalent if its final_score diverges from what an "
                 "independent, honest reading of the actual evidence at the "
                 "URL would produce, even if that output's own internal "
