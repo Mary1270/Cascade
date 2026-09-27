@@ -14,6 +14,7 @@ import pytest
 from _bootstrap import (
     make_wired, set_caller, set_value,
     ESCROW_ADDRESS, PANEL_ADDRESS, CONTRACTOR_ADDRESS, STRANGER_ADDRESS,
+    OWNER_ADDRESS,
 )
 from genlayer import gl
 
@@ -134,13 +135,13 @@ def test_reset_then_resubmit_ignores_a_late_stale_callback():
     set_caller(CONTRACTOR_ADDRESS)
     escrow.reset_stuck_milestone(project_id, 0)
     with patch.object(gl.nondet.web, "render", return_value="page"):
-        with patch.object(gl.nondet, "exec_prompt", side_effect=[_score(90)] * 3):
+        with patch.object(gl.nondet, "exec_prompt", side_effect=[_score(95)] * 3):
             set_caller(CONTRACTOR_ADDRESS)
             escrow.submit_milestone_evidence(project_id, 0, "real desc", "https://x.test")
 
     record = json.loads(escrow.get_project(project_id))
     assert record["milestones"][0]["status"] == "scored"
-    assert record["milestones"][0]["score"] == 90
+    assert record["milestones"][0]["score"] == 100
 
     # Now the original (attempt=0) evaluation, which was abandoned by the
     # reset, finally "arrives" and tries to apply a stale, wrong score.
@@ -150,7 +151,7 @@ def test_reset_then_resubmit_ignores_a_late_stale_callback():
 
     # The real, correctly-scored result must be untouched.
     record = json.loads(escrow.get_project(project_id))
-    assert record["milestones"][0]["score"] == 90
+    assert record["milestones"][0]["score"] == 100
 
 
 def test_good_track_record_relaxes_the_next_evaluation():
@@ -169,13 +170,15 @@ def test_good_track_record_relaxes_the_next_evaluation():
 
     set_caller(CONTRACTOR_ADDRESS)
     with patch.object(gl.nondet.web, "render", return_value="page"):
-        # 61/61/61 -> mean 61 -> without bonus rounds to 60, with the +5
-        # relaxed bonus (66) rounds to 65.
-        with patch.object(gl.nondet, "exec_prompt", side_effect=[_score(61)] * 3):
+        # 70/70/67 -> mean 69 -> without bonus rounds to bucket 60, with the
+        # +5 relaxed bonus (74) rounds to bucket 80.
+        with patch.object(
+            gl.nondet, "exec_prompt", side_effect=[_score(70), _score(70), _score(67)]
+        ):
             escrow.submit_milestone_evidence(project_id, 0, "desc", "https://x.test")
 
     record = json.loads(escrow.get_project(project_id))
-    assert record["milestones"][0]["score"] == 65
+    assert record["milestones"][0]["score"] == 80
 
 
 def test_no_track_record_uses_strict_threshold():
@@ -187,7 +190,9 @@ def test_no_track_record_uses_strict_threshold():
 
     set_caller(CONTRACTOR_ADDRESS)
     with patch.object(gl.nondet.web, "render", return_value="page"):
-        with patch.object(gl.nondet, "exec_prompt", side_effect=[_score(61)] * 3):
+        with patch.object(
+            gl.nondet, "exec_prompt", side_effect=[_score(70), _score(70), _score(67)]
+        ):
             escrow.submit_milestone_evidence(project_id, 0, "desc", "https://x.test")
 
     record = json.loads(escrow.get_project(project_id))
@@ -293,3 +298,53 @@ def test_refund_stuck_milestone_marks_refunded():
         escrow.reset_stuck_milestone(project_id, 0)
     with pytest.raises(gl.vm.UserError):
         escrow.refund_stuck_milestone(project_id, 0)
+
+
+def test_set_panel_and_set_registry_are_owner_only_and_updatable():
+    from _bootstrap import PerformanceRegistry, register_contract
+
+    _, _, escrow = make_wired()
+
+    new_panel = "0x" + "ee" * 20
+    new_registry_address = "0x" + "dd" * 20
+    set_caller(OWNER_ADDRESS)
+    new_registry = PerformanceRegistry()
+    register_contract(new_registry_address, new_registry)
+
+    with pytest.raises(gl.vm.UserError):
+        set_caller(STRANGER_ADDRESS)
+        escrow.set_panel(new_panel)
+    with pytest.raises(gl.vm.UserError):
+        set_caller(STRANGER_ADDRESS)
+        escrow.set_registry(new_registry_address)
+
+    # Owner can repoint both - this is what lets a future
+    # ReviewerConsensusPanel or PerformanceRegistry fix redeploy just that
+    # one contract without redeploying MilestoneEscrow itself.
+    set_caller(OWNER_ADDRESS)
+    escrow.set_panel(new_panel)
+    set_caller(OWNER_ADDRESS)
+    escrow.set_registry(new_registry_address)
+    set_caller(OWNER_ADDRESS)
+    new_registry.set_escrow(ESCROW_ADDRESS)
+
+    # A stray callback from the OLD panel address must now be rejected,
+    # since apply_score checks against the current (updated) self.panel.
+    set_value(1000)
+    set_caller(CONTRACTOR_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+    record = json.loads(escrow.get_project(project_id))
+    record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["attempt"] = 1
+    escrow.projects[project_id] = json.dumps(record)
+
+    set_caller(PANEL_ADDRESS)  # the OLD panel address
+    with pytest.raises(gl.vm.UserError):
+        escrow.apply_score(project_id, 0, 80, 1)
+
+    set_caller(new_panel)  # the newly-set panel address
+    escrow.apply_score(project_id, 0, 80, 1)
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["status"] == "scored"
+    assert new_registry.get_score_count(CONTRACTOR_ADDRESS) == 1

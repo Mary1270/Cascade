@@ -45,12 +45,26 @@ def test_get_recent_scores_windowed_to_most_recent():
     assert json.loads(registry.get_recent_scores(CONTRACTOR_ADDRESS, 3)) == [70, 80, 90]
 
 
-def test_set_escrow_only_once_and_only_owner():
+def test_set_escrow_owner_only_and_updatable():
     registry, _, _ = make_wired()
-    with pytest.raises(gl.vm.UserError):
-        set_caller(OWNER_ADDRESS)
-        registry.set_escrow(ESCROW_ADDRESS)
 
+    # Non-owner can never update it, regardless of current value.
     with pytest.raises(gl.vm.UserError):
         set_caller(STRANGER_ADDRESS)
-        registry.set_escrow(ESCROW_ADDRESS)
+        registry.set_escrow(STRANGER_ADDRESS)
+
+    # Owner CAN update it again (no longer call-once) - this is what lets
+    # a future MilestoneEscrow redeploy repoint this registry without
+    # redeploying the registry itself.
+    new_escrow = "0x" + "dd" * 20
+    set_caller(OWNER_ADDRESS)
+    registry.set_escrow(new_escrow)
+
+    # The old escrow address can no longer record scores; the new one can.
+    with pytest.raises(gl.vm.UserError):
+        set_caller(ESCROW_ADDRESS)
+        registry.record_score(CONTRACTOR_ADDRESS, 80)
+
+    set_caller(new_escrow)
+    registry.record_score(CONTRACTOR_ADDRESS, 80)
+    assert registry.get_score_count(CONTRACTOR_ADDRESS) == 1
