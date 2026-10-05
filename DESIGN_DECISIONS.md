@@ -471,3 +471,90 @@ fresh deploy of all three is required one more time; going forward,
 thanks to §9, a change confined to one contract should no longer require
 redeploying the other two. `LESSONS_LEARNED.md` §11+ records the v0.3
 deployment and re-verification once it's done.
+
+## 11. v0.4 rework: steward "action needed" — two settlement blockers in `apply_score`
+
+The v0.3 resubmission was not rejected outright this time; the steward
+(Joaquin, Oct 2, 2026) instead asked for two specific fixes to
+`MilestoneEscrow.apply_score` before resubmitting, quoted in full:
+
+> "MilestoneEscrow must defensively reject callback scores outside the
+> allowed 0-100 canonical bucket set before calculating a transfer or
+> recording history. It must also give every unpaid remainder after a
+> score below 100 an explicit terminal path, such as returning it to the
+> payer or making it safely recoverable; currently the milestone becomes
+> scored and that balance can never be withdrawn, refunded, or reused."
+
+Both are real gaps in v0.3's `apply_score`:
+
+1. **No defensive bound on the incoming `score`.** `apply_score` trusted
+   `ReviewerConsensusPanel`'s callback value completely — it checked
+   *who* called (`self.panel`) and *when* (the attempt nonce), but never
+   *what*. `ROUND_BUCKET` in `ReviewerConsensusPanel` constrains the
+   panel's own rounding to `{0,20,40,60,80,100}`, but `MilestoneEscrow`
+   is a separate, independently-redeployable contract (that's the whole
+   point of §9's `set_panel`) — nothing stopped a future panel bug, a
+   differently-configured panel, or a redeploy mistake from calling
+   `apply_score` with an arbitrary integer and having it go straight
+   into a real transfer and a permanent history record.
+
+   Fix: added `VALID_SCORE_BUCKETS = (0, 20, 40, 60, 80, 100)` in
+   `milestone_escrow.py` and a check at the top of `apply_score`, before
+   any arithmetic, transfer, or state write: any `score` outside that
+   set raises `gl.vm.UserError` and the milestone stays untouched in
+   `awaiting_score` (so a legitimate resubmission is still possible via
+   the existing `reset_stuck_milestone` path).
+
+2. **No terminal path for the unpaid remainder.** When `score < 100`,
+   v0.3 computed `amount = allocation * score // 100` and released only
+   that much to the contractor. The difference (`allocation - amount`)
+   simply stayed in the milestone's `allocation` field and in the
+   contract's real GEN balance — recorded nowhere as owed to anyone,
+   with no field marking it refundable and no method able to move it.
+   Once `status` became `scored`, that balance was permanently stuck:
+   not withdrawable by the payer, not claimable by the contractor, not
+   reusable by the project.
+
+   Fix: `apply_score` now computes `remainder = allocation - amount` and,
+   whenever `remainder > 0`, transfers it back to the project's `payer`
+   in the same transaction that releases the earned portion to the
+   contractor — no separate claim step, no new status, no new stuck
+   state to later recover from. A `score == 100` milestone sends exactly
+   one transfer (full payout, no remainder); a `score == 0` milestone
+   sends exactly one transfer (the full allocation back to the payer,
+   none to the contractor) — covered explicitly by
+   `test_apply_score_full_marks_sends_no_remainder_transfer` and
+   `test_apply_score_zero_score_refunds_full_allocation_to_payer_not_contractor`.
+
+This refund is deliberately automatic rather than a separate
+payer-triggered withdrawal method (the pattern used for
+`refund_stuck_milestone`): unlike a stuck `awaiting_score` milestone,
+where the payer must first confirm off-chain that the evaluation
+transaction actually failed before recovering funds, a `scored`
+milestone's remainder has no such ambiguity — the score is final and
+on-chain the moment `apply_score` runs, so there is nothing to wait for
+or verify first.
+
+Five new offline tests cover both fixes directly
+(`test_apply_score_rejects_score_outside_canonical_buckets`,
+`test_apply_score_accepts_every_canonical_bucket`,
+`test_apply_score_refunds_unpaid_remainder_to_payer`,
+`test_apply_score_full_marks_sends_no_remainder_transfer`,
+`test_apply_score_zero_score_refunds_full_allocation_to_payer_not_contractor`
+in `tests/test_milestone_escrow.py`). Verifying the remainder refund
+needed one addition to the offline stub: `emit_transfer` was previously
+a no-op (no prior project needed to observe *that* a transfer happened,
+only resulting state), so `tests/genlayer_stub/genlayer/__init__.py` now
+records every `emit_transfer` call in a module-level `TRANSFERS` list
+that tests can assert against directly. 35/35 tests pass.
+
+Separately, applying a standing instruction for files uploaded to
+GenLayer Studio (long comment blocks, especially at the top of the file,
+have caused problems there before): all three contract files were
+trimmed down to the two mandatory header lines followed by code, with
+the explanatory comments that previously lived inline moved here into
+this document instead. No contract logic changed as part of that trim —
+confirmed by running the full offline suite before and after.
+
+Live verification of both fixes on a fresh three-contract deployment is
+recorded in `LESSONS_LEARNED.md` §12.

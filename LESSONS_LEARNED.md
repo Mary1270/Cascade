@@ -348,3 +348,93 @@ offline tests (`test_relaxed_flag_adds_bonus_before_rounding` and
 appropriate place to verify it precisely; live LLM output cannot be
 steered to a specific raw average on demand.
 
+
+## 12. v0.4 round: live verification of the two `apply_score` settlement fixes
+
+Context: the third steward review (an "action needed" request, not a
+rejection) asked for two fixes in `MilestoneEscrow.apply_score`: reject
+callback scores outside the canonical bucket set before any transfer or
+history write, and give every unpaid remainder (score < 100) an explicit
+terminal path. Both are implemented in v0.4 (see DESIGN_DECISIONS.md §11).
+All three contracts were redeployed so the deployed code matches the
+repository source exactly (the v0.4 contract files also had their long
+comments removed, with no logic change).
+
+**Deployed addresses (GenLayer Studio):**
+- PerformanceRegistry: `0xFBE9a9684C6a42fa322f105089908FdaEaB1D4de`
+- ReviewerConsensusPanel: `0x7ac8599894C5c22339e02383c7F0e2CFD0AaFF1E`
+- MilestoneEscrow: `0x3C69372F472feD7B84edE975bd0055e42b72c363`
+
+Wiring: `set_escrow` was called on the panel and the registry with the
+escrow address. Two wallets were used: A (owner and payer,
+`0x6921398611F6c4793D745348660912D44d4F8479`) and B (contractor,
+`0xf73699c4A8C35a10fBFa74ca07CbEcA99b148Ffd`). Every project below used
+a 1 GEN milestone allocation (`[1000000000000000000]`, deposit 1 GEN).
+
+**Full-marks case (project 0).** Evidence: the project's own GitHub
+repository, described neutrally. The leader's equivalence output was
+`{"sub_scores": [100, 100, 85], "final_score": 100}` and the accepted
+result was the same `final_score` of 100 (consensus: three validators
+agreed, one disagreed, one went idle after quorum). `get_project`
+returned `score: 100`, `released: 1000000000000000000`,
+`status: scored`. One live observation worth keeping honest: while the
+transaction was still in `COMMITTING` the explorer displayed a
+`final_score` of 80, and the finalized result was 100. The raw
+consensus data shows the leader's output was 100, so the 80 was most
+likely a validator's independent output (the validator that voted
+`disagree`), but the dump did not label it, so this is an inference.
+
+**Remainder refund (fix 2), project 1.** Evidence described a milestone
+requiring a web frontend and an external audit report, which the
+repository does not contain. Accepted `final_score` was 40
+(`sub_scores` `[50, 60, 40]`). `apply_score` (tx
+`0x372b2a165172b06ba505512bc7bfd7c189d09137afed2b60997622d4735127c5`)
+finalized and triggered three transactions:
+- a transfer of 0.40 GEN from the escrow to wallet B (the contractor),
+  tx `0x6606b3d007282b18abcb0eae1c4a09627bcad84cf6750800e7d16b3391914e43`
+- a transfer of 0.60 GEN from the escrow to wallet A (the payer),
+  tx `0xf6c0223dcb0cd64e9c873a9be54d34fdbebf47d0d36bbefa097cf0c61f8c8fad`
+- `record_score` on the registry with value 40,
+  tx `0x108c8aa050cd93b7d0822a3d39236d3f122df8e0488b7b6f2b889940a157faa0`
+
+`get_project` returned `score: 40`, `released: 400000000000000000`. The
+two amounts sum to exactly the 1 GEN allocation, so nothing is left in
+the escrow. The 100-score milestone (project 0) produced no refund
+transfer, as intended. Caveat: the explorer shows the two transfer
+transactions with an `ERROR` execution result and `<unknown>` result
+code. Both targets are plain wallets with no contract code to execute,
+so this appears to be how the explorer displays a plain value
+transfer, but it was not independently confirmed against wallet
+balances in this round.
+
+**Out-of-bucket rejection (fix 1), project 2.** To get a milestone
+stuck in `awaiting_score` deterministically, evidence was submitted with
+the malformed URL `notaurl`; `evaluate_milestone` failed with
+`MALFORMED_URL` (tx
+`0x23473cf70d845e24664785606459e17250c2a48317eea3c824b946208b431ae1`),
+and `get_project` confirmed `awaiting_score`, `attempt: 1`. The owner
+then pointed the escrow's panel at wallet A with `set_panel` (so a
+direct call could stand in for the panel) and called
+`apply_score(2, 0, 55, 1)` (tx
+`0x29a32fba543a20b09b5f31ceb518479ad4f02bf57669cbd7777a0b19e1572ff7`).
+It reverted with `Rollback` and the message "score callback is outside
+the allowed canonical bucket set (0, 20, 40, 60, 80, 100) - refusing to
+settle this milestone". No transaction was triggered, and a following
+`get_project` showed the milestone unchanged (`awaiting_score`,
+`released: 0`, `score: null`). The panel was then restored with
+`set_panel` (decimal argument verified to equal the real panel address),
+and the stuck milestone was recovered with `refund_stuck_milestone`
+(tx `0xff671f76679d61f081cfc65f085b32fa4d4050880534607f4acda97e5ac0c48b`,
+`SUCCESS`; the resulting 1 GEN transfer back to the payer was not
+separately inspected).
+
+**Smaller practical facts from this round:**
+- The Studio value field is in GEN, while allocations inside
+  `milestone_allocations_json` are raw 18-decimal units. A first
+  `create_project` with `[100]` and a 100 GEN deposit was rejected by
+  the exact-deposit guard ("deposited value must exactly equal the sum
+  of milestone allocations"); `[1000000000000000000]` with a deposit of
+  1 GEN worked.
+- Address arguments typed into Studio appear in the decoded input of
+  explorer transactions as large decimal integers. The contracts'
+  `_normalize_address` already handles this form.

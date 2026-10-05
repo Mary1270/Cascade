@@ -31,6 +31,17 @@ principle justifications per contract, and confirmed GenVM constraints.
 > rounding bucket to 20 and requiring **exact** `final_score` equality in
 > the `prompt_comparative` principle — no numeric tolerance at all. See
 > `DESIGN_DECISIONS.md` §8.
+>
+> **v0.4 note:** the next steward review asked for two fixes to
+> `MilestoneEscrow.apply_score` before resubmitting, rather than
+> rejecting outright: (1) defensively reject any callback `score`
+> outside the canonical bucket set `{0,20,40,60,80,100}` before
+> calculating a transfer or recording history, and (2) give every
+> unpaid remainder (when `score < 100`) an explicit terminal path — it
+> was previously left stuck in the contract's balance forever. Fixed by
+> validating the score up front and automatically refunding the
+> remainder to the project's `payer` in the same transaction that
+> releases the earned portion. See `DESIGN_DECISIONS.md` §11.
 
 ## How the three contracts work together
 
