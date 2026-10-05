@@ -46,8 +46,16 @@ tests were run there.
 
 __all__ = [
     "gl", "TreeMap", "u256", "DynArray", "i256", "bigint", "Address",
-    "register_contract", "clear_registry",
+    "register_contract", "clear_registry", "TRANSFERS",
 ]
+
+# Added for v0.4: the steward's 4th-round feedback requires
+# MilestoneEscrow to send an actual unpaid-remainder refund transfer
+# (not just update internal bookkeeping), so tests need to observe
+# *that a transfer happened and for how much*, not only the resulting
+# state. TRANSFERS records every emit_transfer() call as
+# (target_address_str, value) so a test can assert on it directly.
+TRANSFERS = []
 
 
 class _SubscriptableContainer:
@@ -274,6 +282,7 @@ def clear_registry() -> None:
     _CONTRACT_REGISTRY.clear()
     _INSTANCE_TO_ADDRESS.clear()
     _CALLER_STACK.clear()
+    TRANSFERS.clear()
 
 
 class _CrossContractProxy:
@@ -329,7 +338,7 @@ class _ContractHandle:
         return _CrossContractProxy(self._target(), self._caller_address())
 
     def emit_transfer(self, value=0):
-        pass  # no GEN-transfer simulation needed for Vigil's tests
+        TRANSFERS.append((str(Address(self._address)), int(value)))
 
 
 def get_contract_at(address):
