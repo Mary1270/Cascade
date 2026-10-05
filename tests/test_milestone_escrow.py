@@ -16,7 +16,7 @@ from _bootstrap import (
     ESCROW_ADDRESS, PANEL_ADDRESS, CONTRACTOR_ADDRESS, STRANGER_ADDRESS,
     OWNER_ADDRESS,
 )
-from genlayer import gl
+from genlayer import gl, TRANSFERS
 
 
 def _score(n):
@@ -119,6 +119,123 @@ def test_apply_score_rejects_stale_attempt():
     record = json.loads(escrow.get_project(project_id))
     assert record["milestones"][0]["status"] == "scored"
     assert record["milestones"][0]["score"] == 80
+
+
+def test_apply_score_rejects_score_outside_canonical_buckets():
+    """4th steward round, blocker 1: apply_score must defensively reject
+    any callback score outside the {0,20,40,60,80,100} bucket set the
+    panel's rounding is restricted to, before calculating any transfer
+    or recording any history -- a bug or a future redeploy of the panel
+    must not be able to push an arbitrary payout straight through."""
+    _, _, escrow = make_wired()
+    set_value(1000)
+    set_caller(CONTRACTOR_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+
+    record = json.loads(escrow.get_project(project_id))
+    record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["attempt"] = 1
+    escrow.projects[project_id] = json.dumps(record)
+
+    set_caller(PANEL_ADDRESS)
+    for bad_score in (1, 50, 99, 150, -10):
+        with pytest.raises(gl.vm.UserError):
+            escrow.apply_score(project_id, 0, bad_score, 1)
+
+    # Rejected callbacks must leave the milestone untouched: still
+    # awaiting_score, nothing released, and no transfer sent.
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["status"] == "awaiting_score"
+    assert record["milestones"][0]["released"] == 0
+    assert TRANSFERS == []
+
+
+def test_apply_score_accepts_every_canonical_bucket():
+    for bucket in (0, 20, 40, 60, 80, 100):
+        _, _, escrow = make_wired()
+        set_value(1000)
+        set_caller(CONTRACTOR_ADDRESS)
+        project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+        set_value(0)
+
+        record = json.loads(escrow.get_project(project_id))
+        record["milestones"][0]["status"] = "awaiting_score"
+        record["milestones"][0]["attempt"] = 1
+        escrow.projects[project_id] = json.dumps(record)
+
+        set_caller(PANEL_ADDRESS)
+        escrow.apply_score(project_id, 0, bucket, 1)
+
+        record = json.loads(escrow.get_project(project_id))
+        assert record["milestones"][0]["status"] == "scored"
+        assert record["milestones"][0]["released"] == 1000 * bucket // 100
+
+
+def test_apply_score_refunds_unpaid_remainder_to_payer():
+    """4th steward round, blocker 2: any unpaid remainder (score < 100)
+    must get an explicit terminal path instead of sitting unreachable in
+    the contract's balance forever. Fixed by refunding it to the payer
+    in the same transaction that releases the earned portion."""
+    _, _, escrow = make_wired()
+    set_value(1000)
+    set_caller(OWNER_ADDRESS)  # payer != contractor, so the two transfers are distinguishable
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+
+    record = json.loads(escrow.get_project(project_id))
+    record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["attempt"] = 1
+    escrow.projects[project_id] = json.dumps(record)
+
+    set_caller(PANEL_ADDRESS)
+    escrow.apply_score(project_id, 0, 60, 1)  # 60% -> 600 earned, 400 remainder
+
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["released"] == 600
+    assert record["milestones"][0]["status"] == "scored"
+    assert (str(CONTRACTOR_ADDRESS).lower(), 600) in [(a.lower(), v) for a, v in TRANSFERS]
+    assert (str(OWNER_ADDRESS).lower(), 400) in [(a.lower(), v) for a, v in TRANSFERS]
+
+
+def test_apply_score_full_marks_sends_no_remainder_transfer():
+    _, _, escrow = make_wired()
+    set_value(1000)
+    set_caller(OWNER_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+
+    record = json.loads(escrow.get_project(project_id))
+    record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["attempt"] = 1
+    escrow.projects[project_id] = json.dumps(record)
+
+    set_caller(PANEL_ADDRESS)
+    escrow.apply_score(project_id, 0, 100, 1)
+
+    assert len(TRANSFERS) == 1  # only the contractor's payout, no remainder refund
+    assert (str(CONTRACTOR_ADDRESS).lower(), 1000) in [(a.lower(), v) for a, v in TRANSFERS]
+
+
+def test_apply_score_zero_score_refunds_full_allocation_to_payer_not_contractor():
+    _, _, escrow = make_wired()
+    set_value(1000)
+    set_caller(OWNER_ADDRESS)
+    project_id = escrow.create_project(CONTRACTOR_ADDRESS, json.dumps([1000]))
+    set_value(0)
+
+    record = json.loads(escrow.get_project(project_id))
+    record["milestones"][0]["status"] = "awaiting_score"
+    record["milestones"][0]["attempt"] = 1
+    escrow.projects[project_id] = json.dumps(record)
+
+    set_caller(PANEL_ADDRESS)
+    escrow.apply_score(project_id, 0, 0, 1)
+
+    record = json.loads(escrow.get_project(project_id))
+    assert record["milestones"][0]["released"] == 0
+    assert len(TRANSFERS) == 1  # no payout to the contractor on a 0 score
+    assert (str(OWNER_ADDRESS).lower(), 1000) in [(a.lower(), v) for a, v in TRANSFERS]
 
 
 def test_reset_then_resubmit_ignores_a_late_stale_callback():
