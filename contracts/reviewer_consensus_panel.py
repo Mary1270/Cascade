@@ -39,39 +39,14 @@ def _clamp_score(value) -> int:
 
 
 def _extract_score_fallback(raw: str) -> int:
-    """Used only when the LLM's response isn't valid JSON at all (found
-    live: with prompt_comparative, every validator independently makes
-    its own LLM calls, so far more total calls happen than under the
-    original prompt_non_comparative design, and at least one occasionally
-    ignores the "strict JSON only" instruction). First look for a
-    'score': <n> style fragment even inside broken JSON; failing that,
-    fall back to the first 1-3 digit number in the text. Raises if truly
-    nothing numeric is found, rather than silently guessing 0 - a wrong
-    but confident 0 would unfairly tank a real evaluation."""
     match = re.search(r'"?score"?\s*[:=]\s*(\d{1,3})', raw, re.IGNORECASE)
     if not match:
         match = re.search(r'\b(\d{1,3})\b', raw)
     if not match:
-        raise gl.vm.UserError(
-            "could not extract a numeric score from the model response"
-        )
+        raise gl.vm.UserError("could not extract a numeric score from the model response")
     return _clamp_score(int(match.group(1)))
 
 
-# The canonical rounding bucket for final_score. This is deliberately wide:
-# a first version rounded to the nearest multiple of 5 and let the
-# equivalence principle treat any two final_scores within 15 points as
-# "equivalent" - but final_score is the exact number that determines the
-# payout percentage and the value recorded in PerformanceRegistry, so a
-# steward review correctly rejected that as allowing materially different
-# payouts (e.g. 65 vs 90) to both pass consensus. The fix binds validation
-# to the payout-preserving value itself: final_score is now rounded to the
-# nearest multiple of ROUND_BUCKET, and prompt_comparative below requires
-# EXACT equality of that value, not a tolerance window on it. The bucket is
-# widened from 5 to 20 specifically so that ordinary LLM sampling noise
-# across independently-run leader/validator evaluations is likely to still
-# land in the same bucket, keeping exact-match consensus achievable while
-# the mechanism remains clearly non-binary (0/20/40/60/80/100).
 ROUND_BUCKET = 20
 
 
@@ -85,9 +60,6 @@ class ReviewerConsensusPanel(gl.Contract):
         self.escrow = Address(int(0).to_bytes(20, "big"))
         self.escrow_set = False
 
-    # Owner-updatable, not call-once - see PerformanceRegistry.set_escrow
-    # for the rationale (avoids a full redeploy every time MilestoneEscrow
-    # changes address).
     @gl.public.write
     def set_escrow(self, escrow_address) -> None:
         if gl.message.sender_address != self.owner:
@@ -95,14 +67,6 @@ class ReviewerConsensusPanel(gl.Contract):
         self.escrow = _normalize_address(escrow_address)
         self.escrow_set = True
 
-    # Called by MilestoneEscrow via .emit() (fire-and-forget, async - see
-    # DESIGN_DECISIONS.md #5 for why this is a @gl.public.write and not a
-    # @gl.public.view: nondet/eq_principle execution inside a method reached
-    # cross-contract via .view() was never live-verified by any prior
-    # project in this series, so the architecture was deliberately built to
-    # not depend on it at all, rather than gambling on unconfirmed GenVM
-    # behavior. The result is delivered back to MilestoneEscrow with a
-    # second, separate .emit() call (apply_score) once scoring finishes.
     @gl.public.write
     def evaluate_milestone(
         self,
@@ -161,18 +125,6 @@ class ReviewerConsensusPanel(gl.Contract):
             )
 
             sub_scores = [literal_score, outcome_score, skeptical_score]
-            # The three-way average is still deterministic Python, not LLM
-            # arithmetic - but correctness no longer rests on that alone.
-            # Because this whole function is wrapped in prompt_comparative
-            # (not prompt_non_comparative), every validator independently
-            # re-executes this entire function - fetching the real evidence
-            # page itself and generating its own three sub-scores - rather
-            # than merely auditing the leader's self-reported JSON for
-            # internal consistency. final_score is rounded to the nearest
-            # ROUND_BUCKET (see its definition above for why 20, not 5) so
-            # that ordinary LLM sampling noise across nodes is likely to
-            # still land on the same canonical value - the principle below
-            # requires that value to match EXACTLY, not approximately.
             raw_average = sum(sub_scores) / len(sub_scores)
             if relaxed:
                 raw_average = min(100.0, raw_average + 5.0)
@@ -214,8 +166,6 @@ class ReviewerConsensusPanel(gl.Contract):
         parsed = json.loads(_extract_json_object(result_json))
         final_score = _clamp_score(parsed.get("final_score", 0))
 
-        # Cross-contract .emit() calls, strictly outside the nondet/eq_principle
-        # block above, per the standing rule confirmed since Tribunal.
         gl.get_contract_at(self.escrow).emit().apply_score(
             project_id, milestone_index, u256(final_score), attempt
         )

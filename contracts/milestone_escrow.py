@@ -18,14 +18,10 @@ STATUS_AWAITING_SCORE = "awaiting_score"
 STATUS_SCORED = "scored"
 STATUS_REFUNDED = "refunded"
 
-# History window read from PerformanceRegistry before each new evaluation,
-# and the average-score bar a contractor must clear over that window for
-# MilestoneEscrow to ask ReviewerConsensusPanel for a relaxed (more
-# lenient) read. Both numbers are a deliberate, documented policy choice
-# living here (not in PerformanceRegistry, which stays policy-free) - see
-# DESIGN_DECISIONS.md section on PerformanceRegistry.
 TRUST_WINDOW = 3
 TRUST_AVERAGE_THRESHOLD = 85
+
+VALID_SCORE_BUCKETS = (0, 20, 40, 60, 80, 100)
 
 
 class MilestoneEscrow(gl.Contract):
@@ -41,17 +37,6 @@ class MilestoneEscrow(gl.Contract):
         self.registry = _normalize_address(registry_address)
         self.next_project_id = u256(0)
 
-    # Owner-updatable pointers to the other two contracts. v0.2 and v0.3
-    # each needed a full fresh redeploy of all three contracts purely
-    # because these addresses were only ever set in the constructor, with
-    # no way to repoint them when ReviewerConsensusPanel or
-    # PerformanceRegistry's code changed (and therefore address) without
-    # this one's own code changing. The owner already fully controls
-    # initial wiring, so letting them repoint these later grants no new
-    # capability an honest owner didn't already effectively have via
-    # redeploy - it just avoids the redeploy. Existing projects/milestones
-    # are unaffected: only future evaluate_milestone/apply_score/
-    # record_score calls use the newly-pointed-to address.
     @gl.public.write
     def set_panel(self, panel_address) -> None:
         if gl.message.sender_address != self.owner:
@@ -64,12 +49,6 @@ class MilestoneEscrow(gl.Contract):
             raise gl.vm.UserError("only owner can set registry")
         self.registry = _normalize_address(registry_address)
 
-    # Funds a new project. `milestone_allocations_json` is a JSON array of
-    # integer amounts (same 18-decimal units as gl.message.value) - passed
-    # as a JSON string rather than a typed list parameter, since no
-    # contract in this series has yet live-verified a list-typed public
-    # method argument and there is no reason to introduce that risk here
-    # when a JSON string is already a proven pattern (Tribunal, Vigil).
     @gl.public.write.payable
     def create_project(self, contractor, milestone_allocations_json: str) -> u256:
         allocations = json.loads(milestone_allocations_json)
@@ -111,11 +90,6 @@ class MilestoneEscrow(gl.Contract):
         self.projects[project_id] = json.dumps(record)
         return project_id
 
-    # Reads the contractor's real history from PerformanceRegistry (a plain
-    # .view(), outside any nondet block, before ever contacting the panel),
-    # then requests scoring from ReviewerConsensusPanel via .emit(). Because
-    # .emit() is asynchronous, the score is NOT available when this call
-    # returns - it arrives later via apply_score().
     @gl.public.write
     def submit_milestone_evidence(
         self,
@@ -160,13 +134,6 @@ class MilestoneEscrow(gl.Contract):
             relaxed, u256(attempt),
         )
 
-    # Callback from ReviewerConsensusPanel only. Releases exactly
-    # allocation * score / 100 - the core of the "proportional, not
-    # binary" mechanism. `attempt` must match the milestone's current
-    # submission nonce (see submit_milestone_evidence) - this rejects a
-    # late-arriving callback from a stale attempt that was superseded by
-    # reset_stuck_milestone + a fresh resubmission, closing a race where
-    # an old evaluation could otherwise silently score a new submission.
     @gl.public.write
     def apply_score(
         self, project_id: u256, milestone_index: u256, score: u256, attempt: u256
@@ -188,7 +155,16 @@ class MilestoneEscrow(gl.Contract):
             raise gl.vm.UserError("stale evaluation attempt - milestone was reset since this evaluation started")
 
         score_int = int(score)
-        amount = (milestone["allocation"] * score_int) // 100
+        if score_int not in VALID_SCORE_BUCKETS:
+            raise gl.vm.UserError(
+                "score callback is outside the allowed canonical bucket set "
+                f"{VALID_SCORE_BUCKETS} - refusing to settle this milestone"
+            )
+
+        allocation = milestone["allocation"]
+        amount = (allocation * score_int) // 100
+        remainder = allocation - amount
+
         milestone["released"] = amount
         milestone["status"] = STATUS_SCORED
         milestone["score"] = score_int
@@ -199,19 +175,12 @@ class MilestoneEscrow(gl.Contract):
         if amount > 0:
             gl.get_contract_at(contractor_addr).emit_transfer(value=amount)
 
+        if remainder > 0:
+            payer_addr = _normalize_address(record["payer"])
+            gl.get_contract_at(payer_addr).emit_transfer(value=remainder)
+
         gl.get_contract_at(self.registry).emit().record_score(contractor_addr, score)
 
-    # If ReviewerConsensusPanel's evaluate_milestone transaction itself
-    # fails (e.g. an unreachable evidence_url, as happened live during
-    # testing - see LESSONS_LEARNED.md), it never calls back apply_score,
-    # and the milestone is permanently stuck in "awaiting_score" with no
-    # automatic way out: MilestoneEscrow has no on-chain way to detect
-    # *why* a callback hasn't arrived (it could simply still be
-    # processing), so recovery is a deliberate, payer-triggered action,
-    # not an automatic timeout. The payer (the account that funded the
-    # project) decides, off-chain, once they've confirmed via the
-    # explorer that the corresponding evaluate_milestone transaction
-    # actually failed - not merely that it hasn't finished yet.
     @gl.public.write
     def reset_stuck_milestone(self, project_id: u256, milestone_index: u256) -> None:
         if project_id not in self.projects:
@@ -232,8 +201,6 @@ class MilestoneEscrow(gl.Contract):
         milestone["evidence_url"] = ""
         self.projects[project_id] = json.dumps(record)
 
-    # Alternative to reset: permanently refund this milestone's allocation
-    # back to the payer instead of giving the contractor another attempt.
     @gl.public.write
     def refund_stuck_milestone(self, project_id: u256, milestone_index: u256) -> None:
         if project_id not in self.projects:
